@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+:root {
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  
+  --bg-app: #08080a;
+  --bg-pane: #0f1015;
+  --bg-card: #151720;
+  --bg-card-hover: #1c1f2b;
+  --bg-active: #232736;
+  
+  --border: #232738;
+  --border-active: #383e58;
+  --border-focus: #5b658d;
+  
+  --text: #f0f2f8;
+  --text-muted: #848ca3;
+  --text-dim: #525970;
+  
+  --green: #10b981;
+  --green-glow: rgba(16, 185, 129, 0.25);
+  
+  --red: #f43f5e;
+  --red-bg: rgba(244, 63, 94, 0.12);
+  --red-glow: rgba(244, 63, 94, 0.35);
+  
+  --yellow: #f59e0b;
+  --yellow-bg: rgba(245, 158, 11, 0.12);
+  
+  --blue: #3b82f6;
+  --blue-bg: rgba(59, 130, 246, 0.15);
+  
+  --purple: #8b5cf6;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monospace areas */
+pre, code, .font-mono {
+  font-family: var(--font-mono);
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-active);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+/* Inputs & Forms */
+input, select, textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  transition: all 0.15s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px var(--blue-bg);
+}
+
+button {
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Animations */
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 var(--red-glow); }
+  50% { box-shadow: 0 0 16px 2px var(--red-glow); }
+}
+
+.root-cause-pulse {
+  animation: pulse-red 2.5s infinite;
+}

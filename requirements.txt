@@ -1,7 +1,7 @@
-fastapi==0.142.2
-uvicorn==0.54.0
-pydantic==2.13.5
-pydantic_core==2.46.5
-typing-inspection==0.4.4
-typing_extensions==4.16.0
-annotated-types==0.8.0
+fastapi>=0.136.0
+uvicorn>=0.44.0
+pydantic>=2.13.5
+httpx>=0.28.1
+requests>=2.32.5
+openai>=2.21.0
+python-dotenv>=1.2.2

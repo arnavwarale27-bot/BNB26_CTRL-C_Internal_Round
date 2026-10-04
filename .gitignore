@@ -28,3 +28,4 @@ __pycache__/
 venv/
 blackbox.db
 .DS_Store
+.env

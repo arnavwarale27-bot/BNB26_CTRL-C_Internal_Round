@@ -1,341 +1,438 @@
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 import os
+import subprocess
+import sys
 import tempfile
+import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from blackbox.database import TraceDatabase
-from blackbox.unified_diagnosis import UnifiedDiagnosis
-from blackbox.explanation import FailureExplanation
-from blackbox.coding_recorder import CodingRecorder
-from blackbox.execution_result import ExecutionResult
+from blackbox.config import settings
+from blackbox.database import GenericTraceDatabase
+from blackbox.models import GenericSpan, IngestSpansRequest, GenericReplayRequest
+from blackbox.replay import ReplayEngine
+from blackbox.comparator import TraceComparator
+from blackbox.llm_diagnosis import LLMDiagnosisEngine
 
 
 app = FastAPI(
     title="Black Box",
-    description="Flight Recorder and Execution Debugger for AI Coding Agents",
-    version="1.0.0"
+    description="Universal, Framework-Agnostic AI Debugger & Flight Recorder",
+    version="2.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 # ============================================================
-# REQUEST MODELS
+# GENERIC REQUEST MODELS
 # ============================================================
 
-class DiagnoseRequest(BaseModel):
+class GenericDiagnoseRequest(BaseModel):
     trace_id: str
-    expected_path: List[str]
-    expected_output: Optional[Any] = None
-
-
-class CodingExecutionRequest(BaseModel):
-    command: List[str]
-    cwd: Optional[str] = None
-
-
-class CodeExecutionRequest(BaseModel):
-    code: str
-    filename: str = "agent_code.py"
-
-
-class AgentExecutionRequest(BaseModel):
-    task: str
-    commands: List[List[str]]
     expected_path: Optional[List[str]] = None
     expected_output: Optional[Any] = None
+
+    class Config:
+        extra = "allow"
+
+
+class ArbitraryRunRequest(BaseModel):
+    entrypoint_command: Optional[List[str]] = None
+    code: Optional[str] = None
     cwd: Optional[str] = None
+    env_vars: Optional[Dict[str, str]] = None
 
 
 # ============================================================
-# ROOT
+# ROOT HEALTH PROBE
 # ============================================================
 
 @app.get("/")
 def root():
-
     return {
-        "name": "Black Box",
-        "description": "Flight Recorder for AI Coding Agents",
+        "platform": "Black Box",
+        "description": "Universal Framework-Agnostic Observability & Replay Platform",
+        "version": "2.1.0",
         "status": "running"
     }
 
 
 # ============================================================
-# GET TRACE
+# GENERIC GRAPH & SPAN INGESTION (REAL DATABASE INSERTION)
 # ============================================================
 
+@app.post("/traces")
+@app.post("/traces/ingest")
+async def ingest_spans(request: Request):
+    """
+    Receives JSON trace payload (single span, array of spans, or object with spans/events)
+    and executes a real INSERT statement into the SQLite database.
+    Returns 200 OK with the trace_id.
+    """
+    body = await request.json()
+
+    if isinstance(body, list):
+        items = body
+    elif isinstance(body, dict):
+        if "spans" in body:
+            items = body["spans"]
+        elif "events" in body:
+            items = body["events"]
+        else:
+            # Single span payload: { "trace_id": ..., "name": ..., "inputs": ..., "outputs": ..., "status": ... }
+            items = [body]
+    else:
+        items = []
+
+    spans_to_save: List[GenericSpan] = []
+    primary_trace_id = "run_default"
+
+    for item in items:
+        tid = item.get("trace_id") or primary_trace_id
+        primary_trace_id = tid
+
+        # Handle outputs
+        outputs = item.get("outputs")
+        if outputs is None:
+            if "result" in item:
+                outputs = {"result": item.get("result")}
+            else:
+                outputs = {}
+
+        spans_to_save.append(
+            GenericSpan(
+                trace_id=tid,
+                span_id=item.get("span_id") or item.get("step_id") or f"span_{uuid.uuid4().hex[:8]}",
+                parent_span_id=item.get("parent_span_id") or item.get("parent_step_id"),
+                function_name=item.get("function_name") or item.get("name") or "anonymous_step",
+                inputs=item.get("inputs") or {},
+                outputs=outputs,
+                locals=item.get("locals") or {},
+                timestamp=item.get("timestamp") or datetime.now(timezone.utc),
+                duration_ms=item.get("duration_ms"),
+                status=item.get("status") or "success",
+                error=item.get("error"),
+                metadata=item.get("metadata") or {}
+            )
+        )
+
+    db = GenericTraceDatabase()
+    db.save_spans(spans_to_save)
+
+    return {
+        "status": "success",
+        "trace_id": primary_trace_id,
+        "ingested_count": len(spans_to_save)
+    }
+
+
+# ============================================================
+# GENERIC DAG QUERIES
+# ============================================================
+
+@app.get("/traces")
+def list_traces():
+    """
+    Returns high-level DAG trace summaries recorded in SQLite.
+    """
+    db = GenericTraceDatabase()
+    return {
+        "traces": db.list_traces()
+    }
+
+
 @app.get("/traces/{trace_id}")
-def get_trace(trace_id: str):
+def get_trace_dag(trace_id: str):
+    """
+    Retrieves the complete generic DAG of nodes and edges for any trace.
+    """
+    db = GenericTraceDatabase()
+    spans = db.get_trace(trace_id)
 
-    db = TraceDatabase()
-
-    trace = db.get_trace(trace_id)
-
-    if not trace:
-
+    if not spans:
         raise HTTPException(
             status_code=404,
-            detail="Trace not found"
+            detail=f"Trace DAG '{trace_id}' not found in database."
         )
 
     return {
         "trace_id": trace_id,
-        "steps": trace
+        "nodes": spans,
+        "steps": spans  # Backward-compatible alias
     }
 
 
 # ============================================================
-# CODING EXECUTION
+# UNIVERSAL REPLAY ENGINE
 # ============================================================
 
-@app.post("/coding/execute")
-def coding_execute(request: CodingExecutionRequest):
+@app.post("/replay")
+async def replay_execution(request: Request):
+    """
+    Universal Time-Travel Replay:
+    - Stubs spans 1..N-1 from SQLite cache.
+    - Injects modified inputs/outputs at span N.
+    - Executes live from span N forward via dynamic Python dispatch or subprocess.
+    """
+    body = await request.json()
+    trace_id = body.get("trace_id")
+    checkpoint_span_id = body.get("checkpoint_span_id") or body.get("checkpoint_step_id")
+    modified_output = body.get("modified_output")
+    modified_inputs = body.get("modified_inputs")
 
-    recorder = CodingRecorder()
-
-    try:
-
-        recorder.run_command(
-            command=request.command,
-            cwd=request.cwd
+    if not trace_id or not checkpoint_span_id:
+        raise HTTPException(
+            status_code=400,
+            detail="trace_id and checkpoint_span_id are required."
         )
 
-    except Exception:
+    db = GenericTraceDatabase()
+    original_dag = db.get_trace(trace_id)
 
-        pass
-
-    trace = recorder.get_trace()
-
-    result = ExecutionResult().build(trace)
-
-    return {
-        "trace_id": recorder.recorder.trace_id,
-        "result": result
-    }
-
-
-# ============================================================
-# RUN PYTHON CODE
-# ============================================================
-
-@app.post("/coding/run-code")
-def run_code(request: CodeExecutionRequest):
-
-    temp_dir = tempfile.mkdtemp()
-
-    filename = os.path.basename(
-        request.filename
-    )
-
-    if not filename.endswith(".py"):
-
-        filename = filename + ".py"
-
-    file_path = os.path.join(
-        temp_dir,
-        filename
-    )
-
-    with open(
-        file_path,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(request.code)
-
-    recorder = CodingRecorder()
-
-    try:
-
-        recorder.run_command(
-            command=[
-                "python",
-                file_path
-            ],
-            cwd=temp_dir
+    if not original_dag:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Trace DAG '{trace_id}' not found."
         )
 
-    except Exception:
+    engine = ReplayEngine()
+    try:
+        replay_dag = engine.replay(
+            trace=original_dag,
+            checkpoint_step_id=checkpoint_span_id,
+            modified_output=modified_output or modified_inputs
+        )
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
 
-        pass
-
-    trace = recorder.get_trace()
-
-    result = ExecutionResult().build(trace)
+    comparison = TraceComparator().compare(
+        original_trace=original_dag,
+        replay_trace=replay_dag
+    )
 
     return {
-        "trace_id": recorder.recorder.trace_id,
-        "filename": filename,
-        "result": result
+        "trace_id": trace_id,
+        "checkpoint_span_id": checkpoint_span_id,
+        "replay_dag": replay_dag,
+        "replay_trace": replay_dag,
+        "comparison": comparison
     }
 
 
 # ============================================================
-# DIAGNOSE EXISTING TRACE
+# UNIVERSAL AI DIAGNOSIS
 # ============================================================
 
 @app.post("/diagnose")
-def diagnose(request: DiagnoseRequest):
+def diagnose_generic_trace(request: GenericDiagnoseRequest):
+    """
+    Runs LLM-as-a-judge failure analysis across arbitrary code execution DAGs.
+    """
+    db = GenericTraceDatabase()
+    spans = db.get_trace(request.trace_id)
 
-    db = TraceDatabase()
-
-    trace = db.get_trace(
-        request.trace_id
-    )
-
-    if not trace:
-
+    if not spans:
         raise HTTPException(
             status_code=404,
-            detail="Trace not found"
+            detail=f"Trace '{request.trace_id}' not found."
         )
 
-    diagnosis = UnifiedDiagnosis().diagnose(
-        trace=trace,
+    diagnosis_engine = LLMDiagnosisEngine()
+    diagnosis = diagnosis_engine.diagnose(
+        trace=spans,
         expected_path=request.expected_path,
         expected_output=request.expected_output
-    )
-
-    explanation = FailureExplanation().explain(
-        diagnosis
     )
 
     return {
         "trace_id": request.trace_id,
         "diagnosis": diagnosis,
-        "explanation": explanation
+        "explanation": diagnosis.get("explanation", "")
     }
 
 
 # ============================================================
-# MULTI-STEP AI AGENT EXECUTION
+# ARBITRARY SCRIPT / ENTRYPOINT RUNNER (DYNAMIC TELEMETRY INJECTION)
 # ============================================================
 
-@app.post("/agent/execute")
-def agent_execute(
-    request: AgentExecutionRequest
-):
+@app.post("/execution/run")
+def run_arbitrary_code(request: ArbitraryRunRequest):
+    """
+    Executes any arbitrary Python script or entrypoint command.
+    Dynamically injects the self-contained BlackBox tracing logic and PYTHONPATH
+    so executing in temporary directories never throws ModuleNotFoundError and
+    always posts traces directly to the /traces database endpoint.
+    """
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    trace_id = f"run_{uuid.uuid4().hex[:8]}"
 
-    recorder = CodingRecorder()
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{project_root}:{existing_pythonpath}" if existing_pythonpath else project_root
+    env["BLACKBOX_API_URL"] = settings.api_url
+    env["BLACKBOX_TRACE_ID"] = trace_id
 
-    # Execute every step of the agent workflow
-    for command in request.commands:
+    if request.env_vars:
+        env.update(request.env_vars)
 
+    if request.code:
+        # Prepend universal Black Box telemetry injector directly into script code
+        injected_bootstrap = f"""# --- INJECTED BLACKBOX TELEMETRY MODULE ---
+import sys, os, json, time, uuid, urllib.request, functools, inspect
+from datetime import datetime, timezone
+
+_PROJECT_ROOT = {repr(project_root)}
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+_TRACE_ID = os.getenv("BLACKBOX_TRACE_ID", {repr(trace_id)})
+_API_URL = os.getenv("BLACKBOX_API_URL", {repr(settings.api_url)})
+
+class _InjectedBlackBoxSDK:
+    def __init__(self, api_url=_API_URL, trace_id=_TRACE_ID):
+        self.api_url = api_url.rstrip("/")
+        self.trace_id = trace_id
+        self._current_parent = None
+
+    def new_trace(self, tid=None):
+        if tid:
+            self.trace_id = tid
+        return self.trace_id
+
+    def get_current_trace_id(self):
+        return self.trace_id
+
+    def emit_span(self, span_dict):
         try:
-
-            recorder.run_command(
-                command=command,
-                cwd=request.cwd
+            url = f"{{self.api_url}}/traces"
+            data = json.dumps(span_dict).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={{"Content-Type": "application/json"}},
+                method="POST"
             )
-
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                pass
         except Exception:
+            pass
 
-            # Continue recording the workflow
-            # even if one step fails.
-            continue
+    def trace(self, func_or_name=None, **kwargs):
+        def dec(fn):
+            fn_name = (func_or_name if isinstance(func_or_name, str) else kwargs.get("name")) or fn.__name__
+            sig = inspect.signature(fn)
 
-    # Get complete execution trace
-    trace = recorder.get_trace()
+            @functools.wraps(fn)
+            def wrapper(*args, **kw):
+                span_id = f"span_{{uuid.uuid4().hex[:8]}}"
+                parent_id = self._current_parent
+                self._current_parent = span_id
 
-    # Build clean execution result
-    result = ExecutionResult().build(
-        trace
-    )
+                inputs = {{}}
+                try:
+                    bound = sig.bind(*args, **kw)
+                    bound.apply_defaults()
+                    for k, v in bound.arguments.items():
+                        try:
+                            json.dumps(v)
+                            inputs[k] = v
+                        except:
+                            inputs[k] = str(v)
+                except Exception:
+                    inputs = {{"args": [str(a) for a in args], "kwargs": {{str(k): str(v) for k, v in kw.items()}}}}
 
-    response = {
-        "trace_id": recorder.recorder.trace_id,
-        "task": request.task,
-        "result": result
-    }
+                start = time.perf_counter()
+                status = "success"
+                error = None
+                out = None
+                try:
+                    out = fn(*args, **kw)
+                    return out
+                except Exception as ex:
+                    status = "failed"
+                    error = f"{{type(ex).__name__}}: {{str(ex)}}"
+                    raise ex
+                finally:
+                    dur = round((time.perf_counter() - start) * 1000, 2)
+                    try:
+                        json.dumps(out)
+                        safe_out = {{"result": out}}
+                    except:
+                        safe_out = {{"result": str(out)}}
 
-    # Run diagnosis when expected path is provided
-    if request.expected_path is not None:
+                    span = {{
+                        "trace_id": self.trace_id,
+                        "span_id": span_id,
+                        "parent_span_id": parent_id,
+                        "name": fn_name,
+                        "function_name": fn_name,
+                        "inputs": inputs,
+                        "outputs": safe_out,
+                        "duration_ms": dur,
+                        "status": status,
+                        "error": error,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }}
+                    self.emit_span(span)
+                    self._current_parent = parent_id
 
-        diagnosis = UnifiedDiagnosis().diagnose(
-            trace=trace,
-            expected_path=request.expected_path,
-            expected_output=request.expected_output
-        )
+            return wrapper
 
-        explanation = FailureExplanation().explain(
-            diagnosis
-        )
+        if callable(func_or_name):
+            return dec(func_or_name)
+        return dec
 
-        response["diagnosis"] = diagnosis
+blackbox = _InjectedBlackBoxSDK()
+trace = blackbox.trace
+new_trace = blackbox.new_trace
+get_current_trace_id = blackbox.get_current_trace_id
 
-        response["explanation"] = explanation
+# Make sure importing blackbox in user code uses this configured instance
+sys.modules['blackbox'] = blackbox
+# --- END INJECTED TELEMETRY ---
 
-    return response
+"""
+        full_code = injected_bootstrap + request.code
 
+        temp_dir = tempfile.mkdtemp()
+        file_path = os.path.join(temp_dir, "target_script.py")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(full_code)
 
-# ============================================================
-# FRONTEND-FRIENDLY AGENT HISTORY
-# ============================================================
-
-@app.get("/agent/history/{trace_id}")
-def agent_history(
-    trace_id: str
-):
-
-    db = TraceDatabase()
-
-    trace = db.get_trace(
-        trace_id
-    )
-
-    if not trace:
-
+        cmd = [sys.executable, file_path]
+        cwd = temp_dir
+    elif request.entrypoint_command:
+        cmd = request.entrypoint_command
+        cwd = request.cwd or project_root
+    else:
         raise HTTPException(
-            status_code=404,
-            detail="Trace not found"
+            status_code=400,
+            detail="Must provide either 'code' or 'entrypoint_command'."
         )
 
-    result = ExecutionResult().build(
-        trace
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True
     )
-
-    failed_steps = [
-        {
-            "step_id": event.get(
-                "step_id"
-            ),
-
-            "name": event.get(
-                "name"
-            ),
-
-            "error": event.get(
-                "error"
-            ),
-
-            "status": event.get(
-                "status"
-            )
-        }
-
-        for event in trace
-
-        if event.get(
-            "status"
-        ) == "failed"
-    ]
 
     return {
+        "status": "success" if proc.returncode == 0 else "failed",
         "trace_id": trace_id,
-
-        "status": result[
-            "status"
-        ],
-
-        "total_steps": len(
-            trace
-        ),
-
-        "history": result[
-            "history"
-        ],
-
-        "failed_steps": failed_steps
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "command": cmd
     }
